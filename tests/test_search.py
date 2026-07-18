@@ -32,13 +32,14 @@ class StubClient:
     def __init__(self, responses: list[StubResponse]) -> None:
         self.responses = iter(responses)
         self.calls = 0
+        self.closed = False
 
     async def get(self, url: str, **kwargs: object) -> StubResponse:
         self.calls += 1
         return next(self.responses)
 
-    async def aclose(self) -> None:
-        pass
+    async def close(self) -> None:
+        self.closed = True
 
 
 def fixture_html_bytes() -> bytes:
@@ -173,3 +174,127 @@ async def test_search_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> Non
     assert client.calls == 2
     assert delays == [3.0]
     assert len(listings) == 3
+
+
+async def test_search_rotates_to_a_clean_profile_after_active_profile_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = fixture_html_bytes()
+    sessions = [
+        StubClient([StubResponse(429) for _ in range(4)]),
+        StubClient([StubResponse(429)]),
+        StubClient([StubResponse(200, html)]),
+    ]
+    created: list[dict[str, object]] = []
+
+    def fake_session(**kwargs: object) -> StubClient:
+        created.append(kwargs)
+        return sessions[len(created) - 1]
+
+    async def fake_sleep(delay: float) -> None:
+        pass
+
+    monkeypatch.setattr("avito_mcp.search.AsyncSession", fake_session)
+    monkeypatch.setattr("avito_mcp.search.asyncio.sleep", fake_sleep)
+    avito = AvitoSearchClient(
+        timeout_seconds=20,
+        max_response_bytes=6_000_000,
+        max_items=100,
+    )
+
+    _, listings = await avito.search("https://www.avito.ru/all", "груша", None)
+
+    assert [options["impersonate"] for options in created] == [
+        "chrome146",
+        "firefox147",
+        "chrome145",
+    ]
+    assert [session.calls for session in sessions] == [4, 1, 1]
+    assert sessions[0].closed is True
+    assert sessions[1].closed is True
+    assert sessions[2].closed is False
+    assert "Brave" in str(created[2]["headers"])
+    assert len(listings) == 3
+
+    await avito.close()
+    assert sessions[2].closed is True
+
+
+async def test_search_rotates_after_http_200_access_check_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = fixture_html_bytes()
+    sessions = [
+        StubClient(
+            [StubResponse(200, "Подтвердите, что вы не робот".encode())]
+        ),
+        StubClient([StubResponse(200, html)]),
+    ]
+    created: list[dict[str, object]] = []
+
+    def fake_session(**kwargs: object) -> StubClient:
+        created.append(kwargs)
+        return sessions[len(created) - 1]
+
+    monkeypatch.setattr("avito_mcp.search.AsyncSession", fake_session)
+    avito = AvitoSearchClient(
+        timeout_seconds=20,
+        max_response_bytes=6_000_000,
+        max_items=100,
+    )
+
+    _, listings = await avito.search("https://www.avito.ru/all", "груша", None)
+
+    assert [options["impersonate"] for options in created] == [
+        "chrome146",
+        "firefox147",
+    ]
+    assert sessions[0].closed is True
+    assert len(listings) == 3
+
+    await avito.close()
+
+
+async def test_search_reports_failure_only_after_every_browser_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = [
+        StubClient([StubResponse(429) for _ in range(4)]),
+        *[StubClient([StubResponse(429)]) for _ in range(4)],
+    ]
+    created: list[dict[str, object]] = []
+
+    def fake_session(**kwargs: object) -> StubClient:
+        created.append(kwargs)
+        return sessions[len(created) - 1]
+
+    async def fake_sleep(delay: float) -> None:
+        pass
+
+    monkeypatch.setattr("avito_mcp.search.AsyncSession", fake_session)
+    monkeypatch.setattr("avito_mcp.search.asyncio.sleep", fake_sleep)
+    avito = AvitoSearchClient(
+        timeout_seconds=20,
+        max_response_bytes=6_000_000,
+        max_items=100,
+    )
+
+    with pytest.raises(AvitoBlockedError) as error:
+        await avito.search("https://www.avito.ru/all", "груша", None)
+
+    assert [options["impersonate"] for options in created] == [
+        "chrome146",
+        "firefox147",
+        "chrome145",
+        "safari2601",
+        "chrome142",
+    ]
+    assert [session.calls for session in sessions] == [4, 1, 1, 1, 1]
+    assert all(session.closed for session in sessions[:-1])
+    assert sessions[-1].closed is False
+    assert "Opera" in str(created[-1]["headers"])
+    assert "chrome, mozilla-firefox, brave-chromium, safari, opera-chromium" in str(
+        error.value
+    )
+
+    await avito.close()

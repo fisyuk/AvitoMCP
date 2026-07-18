@@ -46,7 +46,47 @@ class _Response(Protocol):
 class _AsyncClient(Protocol):
     async def get(self, url: str, **kwargs: object) -> _Response: ...
 
-    async def aclose(self) -> None: ...
+    async def close(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _BrowserProfile:
+    name: str
+    impersonate: str
+    headers: tuple[tuple[str, str], ...] = ()
+
+
+_BROWSER_PROFILES = (
+    _BrowserProfile("chrome", "chrome146"),
+    _BrowserProfile("mozilla-firefox", "firefox147"),
+    _BrowserProfile(
+        "brave-chromium",
+        "chrome145",
+        (
+            (
+                "Sec-CH-UA",
+                '"Chromium";v="145", "Brave";v="145", "Not_A Brand";v="99"',
+            ),
+        ),
+    ),
+    _BrowserProfile("safari", "safari2601"),
+    _BrowserProfile(
+        "opera-chromium",
+        "chrome142",
+        (
+            (
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/142.0.0.0 Safari/537.36 OPR/128.0.0.0",
+            ),
+            (
+                "Sec-CH-UA",
+                '"Chromium";v="142", "Opera";v="128", "Not_A Brand";v="99"',
+            ),
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,50 +284,57 @@ class AvitoSearchClient:
         self._timeout_seconds = timeout_seconds
         self._max_response_bytes = max_response_bytes
         self._max_items = max_items
+        self._proxy_url = proxy_url
+        self._lock = asyncio.Lock()
         self._owns_client = client is None
-        self._client = client or AsyncSession(
-            impersonate="chrome",
-            timeout=timeout_seconds,
+        self._profiles = _BROWSER_PROFILES if self._owns_client else ()
+        self._active_profile_index = 0
+        self._client = client or self._create_client(self._profiles[0])
+
+    def _create_client(self, profile: _BrowserProfile) -> _AsyncClient:
+        headers = {
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
+            **dict(profile.headers),
+        }
+        return AsyncSession(
+            impersonate=profile.impersonate,
+            timeout=self._timeout_seconds,
             allow_redirects=True,
             max_redirects=5,
-            proxy=proxy_url,
+            proxy=self._proxy_url,
             trust_env=False,
-            headers={
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
-            },
+            headers=headers,
         )
 
-    async def search(
-        self, base_url: str, query: str, max_price_rub: int | None
-    ) -> tuple[str, list[Listing]]:
-        url = build_search_url(base_url, query, max_price_rub)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._timeout_seconds
-        try:
-            for attempt in range(_MAX_ATTEMPTS):
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise AvitoError("Avito retry deadline exceeded")
-                response = await self._client.get(url, timeout=remaining)
-                if response.status_code not in _BLOCKED_STATUSES:
-                    break
-                if attempt == _MAX_ATTEMPTS - 1:
-                    break
+    async def _activate_profile(self, profile_index: int) -> None:
+        await self._client.close()
+        self._active_profile_index = profile_index
+        self._client = self._create_client(self._profiles[profile_index])
 
-                # A fresh QRATOR response can establish cookies that make a later
-                # request from the same browser-like session acceptable.
-                delay = _retry_delay(response, attempt)
-                remaining = deadline - loop.time()
-                if delay >= remaining:
-                    break
-                await asyncio.sleep(delay)
-        except RequestException as exc:
-            raise AvitoError(f"Avito request failed: {type(exc).__name__}") from exc
+    async def _request_with_retries(self, url: str, max_attempts: int) -> _Response:
+        response: _Response | None = None
+        for attempt in range(max_attempts):
+            response = await self._client.get(url, timeout=self._timeout_seconds)
+            if response.status_code not in _BLOCKED_STATUSES:
+                return response
+            if attempt == max_attempts - 1:
+                break
 
+            # A fresh QRATOR response can establish cookies that make a later
+            # request from the same browser-like session acceptable.
+            await asyncio.sleep(_retry_delay(response, attempt))
+        assert response is not None
+        return response
+
+    def _profile_order(self) -> list[int]:
+        return [
+            (self._active_profile_index + offset) % len(self._profiles)
+            for offset in range(len(self._profiles))
+        ]
+
+    def _listings_from_response(self, response: _Response) -> list[Listing]:
         if response.status_code in _BLOCKED_STATUSES:
-            raise AvitoBlockedError(
-                f"Avito rejected the request with HTTP {response.status_code}"
-            )
+            raise AvitoBlockedError(f"HTTP {response.status_code}")
         if response.status_code >= 400:
             raise AvitoError(f"Avito returned HTTP {response.status_code}")
         if urlsplit(str(response.url)).hostname != "www.avito.ru":
@@ -297,8 +344,39 @@ class AvitoSearchClient:
 
         encoding = response.encoding or "utf-8"
         html = response.content.decode(encoding, errors="replace")
-        return url, parse_listings(html, self._max_items)
+        return parse_listings(html, self._max_items)
+
+    async def search(
+        self, base_url: str, query: str, max_price_rub: int | None
+    ) -> tuple[str, list[Listing]]:
+        url = build_search_url(base_url, query, max_price_rub)
+        try:
+            async with self._lock:
+                if not self._owns_client:
+                    response = await self._request_with_retries(url, _MAX_ATTEMPTS)
+                    return url, self._listings_from_response(response)
+
+                attempted_profiles = []
+                for order_index, profile_index in enumerate(self._profile_order()):
+                    if profile_index != self._active_profile_index:
+                        await self._activate_profile(profile_index)
+                    profile = self._profiles[profile_index]
+                    attempted_profiles.append(profile.name)
+                    attempts = _MAX_ATTEMPTS if order_index == 0 else 1
+                    response = await self._request_with_retries(url, attempts)
+                    try:
+                        return url, self._listings_from_response(response)
+                    except AvitoBlockedError:
+                        continue
+        except RequestException as exc:
+            raise AvitoError(f"Avito request failed: {type(exc).__name__}") from exc
+
+        raise AvitoBlockedError(
+            "Avito rejected every browser profile or returned an access-check page: "
+            f"{', '.join(attempted_profiles)}"
+        )
 
     async def close(self) -> None:
         if self._owns_client:
-            await self._client.aclose()
+            async with self._lock:
+                await self._client.close()

@@ -124,9 +124,7 @@ def create_app(
         try:
             source_url, listings = await avito.search(base_url, normalized_query, max_price_rub)
         except AvitoBlockedError as exc:
-            raise RuntimeError(
-                "Avito rejected the browser-like request after bounded same-session retries."
-            ) from exc
+            raise RuntimeError(str(exc)) from exc
         except AvitoError as exc:
             raise RuntimeError(str(exc)) from exc
 
