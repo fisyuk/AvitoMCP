@@ -47,8 +47,8 @@ def main() -> int:
 
     verifier, challenge = _pkce()
     host = urlsplit(args.public_base_url).netloc
-    client_id = "http://localhost/smoke-client"
-    redirect_uri = "http://localhost/smoke-callback"
+    client_id = "https://chatgpt.com"
+    redirect_uri = "https://chatgpt.com/connector/oauth/avito-mcp-smoke"
 
     with httpx.Client(
         base_url=args.endpoint,

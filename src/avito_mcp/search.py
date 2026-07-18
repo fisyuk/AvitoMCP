@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import random
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
+from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-import httpx
 from bs4 import BeautifulSoup, Tag
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
+
+_BLOCKED_STATUSES = frozenset({401, 403, 429})
+_MAX_ATTEMPTS = 4
+_RETRY_JITTER_RATIO = 0.2
+_MAX_RETRY_AFTER_SECONDS = 30.0
 
 
 class AvitoError(RuntimeError):
@@ -21,6 +33,20 @@ class AvitoBlockedError(AvitoError):
 
 class AvitoMarkupError(AvitoError):
     pass
+
+
+class _Response(Protocol):
+    status_code: int
+    url: str
+    content: bytes
+    encoding: str | None
+    headers: Mapping[str, str]
+
+
+class _AsyncClient(Protocol):
+    async def get(self, url: str, **kwargs: object) -> _Response: ...
+
+    async def aclose(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +120,30 @@ def search_fingerprint(query: str, max_price_rub: int | None, scope: str) -> str
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _retry_after_seconds(headers: Mapping[str, str]) -> float | None:
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = (retry_at - datetime.now(UTC)).total_seconds()
+    return min(max(0.0, seconds), _MAX_RETRY_AFTER_SECONDS)
+
+
+def _retry_delay(response: _Response, retry_index: int) -> float:
+    server_delay = _retry_after_seconds(response.headers)
+    base_delay = server_delay if server_delay is not None else float(2**retry_index)
+    jitter = random.uniform(1.0 - _RETRY_JITTER_RATIO, 1.0 + _RETRY_JITTER_RATIO)
+    return min(base_delay * jitter, _MAX_RETRY_AFTER_SECONDS)
 
 
 def _text(node: Tag | None) -> str:
@@ -189,23 +239,21 @@ class AvitoSearchClient:
         max_response_bytes: int,
         max_items: int,
         proxy_url: str | None = None,
-        client: httpx.AsyncClient | None = None,
+        client: _AsyncClient | None = None,
     ) -> None:
+        self._timeout_seconds = timeout_seconds
         self._max_response_bytes = max_response_bytes
         self._max_items = max_items
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_seconds),
-            follow_redirects=True,
+        self._client = client or AsyncSession(
+            impersonate="chrome",
+            timeout=timeout_seconds,
+            allow_redirects=True,
+            max_redirects=5,
             proxy=proxy_url,
+            trust_env=False,
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/136.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
-                "Cache-Control": "no-cache",
             },
         )
 
@@ -213,25 +261,42 @@ class AvitoSearchClient:
         self, base_url: str, query: str, max_price_rub: int | None
     ) -> tuple[str, list[Listing]]:
         url = build_search_url(base_url, query, max_price_rub)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeout_seconds
         try:
-            async with self._client.stream("GET", url) as response:
-                if response.status_code in {401, 403, 429}:
-                    raise AvitoBlockedError(
-                        f"Avito rejected the request with HTTP {response.status_code}"
-                    )
-                if response.status_code >= 400:
-                    raise AvitoError(f"Avito returned HTTP {response.status_code}")
-                if urlsplit(str(response.url)).hostname != "www.avito.ru":
-                    raise AvitoError("Avito redirected to an unexpected host")
-                content = bytearray()
-                async for chunk in response.aiter_bytes():
-                    content.extend(chunk)
-                    if len(content) > self._max_response_bytes:
-                        raise AvitoError("Avito response exceeded the configured size limit")
-                encoding = response.encoding or "utf-8"
-        except httpx.HTTPError as exc:
+            for attempt in range(_MAX_ATTEMPTS):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise AvitoError("Avito retry deadline exceeded")
+                response = await self._client.get(url, timeout=remaining)
+                if response.status_code not in _BLOCKED_STATUSES:
+                    break
+                if attempt == _MAX_ATTEMPTS - 1:
+                    break
+
+                # A fresh QRATOR response can establish cookies that make a later
+                # request from the same browser-like session acceptable.
+                delay = _retry_delay(response, attempt)
+                remaining = deadline - loop.time()
+                if delay >= remaining:
+                    break
+                await asyncio.sleep(delay)
+        except RequestException as exc:
             raise AvitoError(f"Avito request failed: {type(exc).__name__}") from exc
-        html = bytes(content).decode(encoding, errors="replace")
+
+        if response.status_code in _BLOCKED_STATUSES:
+            raise AvitoBlockedError(
+                f"Avito rejected the request with HTTP {response.status_code}"
+            )
+        if response.status_code >= 400:
+            raise AvitoError(f"Avito returned HTTP {response.status_code}")
+        if urlsplit(str(response.url)).hostname != "www.avito.ru":
+            raise AvitoError("Avito redirected to an unexpected host")
+        if len(response.content) > self._max_response_bytes:
+            raise AvitoError("Avito response exceeded the configured size limit")
+
+        encoding = response.encoding or "utf-8"
+        html = response.content.decode(encoding, errors="replace")
         return url, parse_listings(html, self._max_items)
 
     async def close(self) -> None:

@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4==4.15.0",
+  "curl_cffi==0.15.0",
   "httpx==0.28.1",
   "mcp==1.28.1",
   "uvicorn[standard]==0.51.0",

@@ -125,8 +125,7 @@ def create_app(
             source_url, listings = await avito.search(base_url, normalized_query, max_price_rub)
         except AvitoBlockedError as exc:
             raise RuntimeError(
-                "Avito blocked the cloud request. Retry later or deploy from an IP Avito accepts; "
-                "the server does not bypass CAPTCHA or access controls."
+                "Avito rejected the browser-like request after bounded same-session retries."
             ) from exc
         except AvitoError as exc:
             raise RuntimeError(str(exc)) from exc

@@ -5,12 +5,44 @@ import pytest
 
 from avito_mcp.search import (
     AvitoBlockedError,
+    AvitoSearchClient,
     build_search_url,
     parse_listings,
     search_fingerprint,
     search_scope,
     validate_search_url,
 )
+
+
+class StubResponse:
+    def __init__(
+        self,
+        status_code: int,
+        content: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self.url = "https://www.avito.ru/all/knigi_i_zhurnaly"
+        self.content = content
+        self.encoding = "utf-8"
+        self.headers = headers or {}
+
+
+class StubClient:
+    def __init__(self, responses: list[StubResponse]) -> None:
+        self.responses = iter(responses)
+        self.calls = 0
+
+    async def get(self, url: str, **kwargs: object) -> StubResponse:
+        self.calls += 1
+        return next(self.responses)
+
+    async def aclose(self) -> None:
+        pass
+
+
+def fixture_html_bytes() -> bytes:
+    return Path("tests/fixtures/avito_search.html").read_bytes()
 
 
 def test_build_search_url_preserves_category_and_replaces_search_parameters() -> None:
@@ -56,3 +88,88 @@ def test_scope_and_fingerprint_ignore_transient_parameters() -> None:
     assert search_fingerprint("  Книга  ", 2000, search_scope(first)) == search_fingerprint(
         "книга", 2000, search_scope(second)
     )
+
+
+async def test_search_retries_qrator_rejection_in_same_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    html = fixture_html_bytes()
+    client = StubClient([StubResponse(429), StubResponse(200, html)])
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("avito_mcp.search.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "avito_mcp.search.random.uniform", lambda low, high: (low + high) / 2
+    )
+    avito = AvitoSearchClient(
+        timeout_seconds=20,
+        max_response_bytes=6_000_000,
+        max_items=100,
+        client=client,
+    )
+
+    _, listings = await avito.search(
+        "https://www.avito.ru/all/knigi_i_zhurnaly", "груша", 2000
+    )
+
+    assert client.calls == 2
+    assert delays == [1.0]
+    assert [listing.id for listing in listings] == ["1000001", "1000002", "1000003"]
+
+
+async def test_search_reports_fourth_qrator_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = StubClient([StubResponse(429) for _ in range(4)])
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("avito_mcp.search.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "avito_mcp.search.random.uniform", lambda low, high: (low + high) / 2
+    )
+    avito = AvitoSearchClient(
+        timeout_seconds=20,
+        max_response_bytes=6_000_000,
+        max_items=100,
+        client=client,
+    )
+
+    with pytest.raises(AvitoBlockedError, match="HTTP 429"):
+        await avito.search("https://www.avito.ru/all", "груша", None)
+
+    assert client.calls == 4
+    assert delays == [1.0, 2.0, 4.0]
+
+
+async def test_search_honors_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    html = fixture_html_bytes()
+    client = StubClient(
+        [StubResponse(429, headers={"Retry-After": "3"}), StubResponse(200, html)]
+    )
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("avito_mcp.search.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(
+        "avito_mcp.search.random.uniform", lambda low, high: (low + high) / 2
+    )
+    avito = AvitoSearchClient(
+        timeout_seconds=20,
+        max_response_bytes=6_000_000,
+        max_items=100,
+        client=client,
+    )
+
+    _, listings = await avito.search("https://www.avito.ru/all", "груша", None)
+
+    assert client.calls == 2
+    assert delays == [3.0]
+    assert len(listings) == 3
