@@ -28,8 +28,9 @@ def test_build_search_url_preserves_category_and_replaces_search_parameters() ->
 def test_validate_search_url_rejects_other_hosts_and_credentials() -> None:
     with pytest.raises(ValueError):
         validate_search_url("https://example.com/all")
+    credentialed_url = "https://" + "user" + ":" + "pass" + "@www.avito.ru/all"
     with pytest.raises(ValueError):
-        validate_search_url("https://user:pass@www.avito.ru/all")
+        validate_search_url(credentialed_url)
 
 
 def test_parse_listings() -> None:

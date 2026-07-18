@@ -36,46 +36,35 @@ ChatGPT не передаёт произвольные API keys удалённо
 общий `ACCESS_CODE`, после чего сервер выдаёт долгоживущий bearer. Это не система
 пользователей; постоянных auth-данных в БД нет.
 
-## Запуск
+## Локальный запуск
 
 ```bash
 cp .env.example .env
 python -c 'import secrets; print(secrets.token_urlsafe(24))'  # ACCESS_CODE
 python -c 'import secrets; print(secrets.token_urlsafe(48))'  # TOKEN_SECRET
-cd ..
-docker compose up -d --build avito-mcp
-```
-
-Нужны публичный HTTPS-домен и постоянный volume для `/data`. За reverse proxy
-приложение доступно как `avito-mcp:8000` только в Docker-сети
-`avito_mcp_ingress`; порт на хост не публикуется. Корневой compose подключает
-Nginx Proxy Manager к той же сети. `PUBLIC_BASE_URL` должен содержать внешний
-HTTPS origin без `/mcp`.
-
-`src/` подключается в контейнер read-only bind mount. Поэтому обычное обновление
-Python-кода на единственном сервере не требует пересборки:
-
-```bash
-git pull --ff-only
-docker compose restart avito-mcp
-```
-
-При изменении зависимостей, Dockerfile, `.env` или compose-конфигурации используйте
-`docker compose up -d --build avito-mcp`.
-
-Если IP хостинга отклоняется, можно задать `AVITO_PROXY_URL` и вывести только
-Avito-трафик через контролируемый вами HTTP proxy, например домашний egress.
-Сторонний residential proxy становится отдельной стороной, видящей факт трафика,
-и может нарушать правила площадки — не подключайте его автоматически.
-
-Для обычного Python-запуска:
-
-```bash
 python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 set -a; source .env; set +a
 .venv/bin/python -m avito_mcp
 ```
+
+## Docker image
+
+Этот репозиторий собирает только образ MCP-сервиса:
+
+```bash
+docker build -t avito-mcp .
+```
+
+Production orchestration намеренно находится вне этого проекта. Внешний проект
+должен передать переменные из `.env`, подключить постоянное хранилище к `/data`,
+направить HTTPS-трафик на порт `8000` и запускать ровно один экземпляр сервиса.
+`PUBLIC_BASE_URL` должен содержать внешний HTTPS origin без `/mcp`.
+
+Если IP хостинга отклоняется, можно задать `AVITO_PROXY_URL` и вывести только
+Avito-трафик через контролируемый вами HTTP proxy, например домашний egress.
+Сторонний residential proxy становится отдельной стороной, видящей факт трафика,
+и может нарушать правила площадки — не подключайте его автоматически.
 
 Используйте один worker. OAuth handshake находится в памяти, а SQLite рассчитан
 на один экземпляр приложения. Для этого персонального hourly monitor несколько
