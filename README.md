@@ -48,18 +48,22 @@ set -a; source .env; set +a
 .venv/bin/python -m avito_mcp
 ```
 
-## Docker image
+## Docker Compose
 
-Этот репозиторий собирает только образ MCP-сервиса:
+Минимальный Compose запускает только MCP-сервис, публикует его порт `8000` и
+хранит SQLite в именованном Docker volume. Reverse proxy и TLS в него не входят.
 
 ```bash
-docker build -t avito-mcp .
+cp .env.example .env
+# Замените ACCESS_CODE, TOKEN_SECRET и PUBLIC_BASE_URL в .env.
+docker compose up -d --build
+curl http://127.0.0.1:8000/healthz
 ```
 
-Production orchestration намеренно находится вне этого проекта. Внешний проект
-должен передать переменные из `.env`, подключить постоянное хранилище к `/data`,
-направить HTTPS-трафик на порт `8000` и запускать ровно один экземпляр сервиса.
-`PUBLIC_BASE_URL` должен содержать внешний HTTPS origin без `/mcp`.
+Сервис доступен на host-порту `8000`; внутри контейнера он также слушает `8000`.
+`PUBLIC_BASE_URL` должен содержать фактический внешний HTTPS origin без `/mcp`.
+Если TLS и домен обслуживаются отдельным проектом, он должен проксировать трафик
+на `http://127.0.0.1:8000`.
 
 Если IP хостинга отклоняется, можно задать `AVITO_PROXY_URL` и вывести только
 Avito-трафик через контролируемый вами HTTP proxy, например домашний egress.
